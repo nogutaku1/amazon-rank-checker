@@ -1,0 +1,29 @@
+name: Daily Ranking Check
+
+on:
+  schedule:
+    # 毎日 01:00 UTC = 10:00 JST (日本時間)
+    - cron: '0 1 * * *'
+  workflow_dispatch:  # 手動実行も可能
+
+jobs:
+  check-ranking:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      
+      - name: Run ranking check
+        run: python main.py
+        env:
+          KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
