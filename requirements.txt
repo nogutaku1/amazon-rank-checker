@@ -2,4 +2,4 @@ streamlit
 pandas
 requests
 plotly
-apscheduler
+supabase

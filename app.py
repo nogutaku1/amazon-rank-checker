@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Amazon カテゴリーランキング監視ダッシュボード v3
+Amazon カテゴリーランキング監視ダッシュボード v4
+- Supabaseでデータを永続化
 - ASINのみ入力で最も詳細なサブカテゴリを自動特定
 - Best Sellers APIでランキングリストから順位を取得
 - 前日比を含むSlack通知
@@ -9,54 +10,106 @@ Amazon カテゴリーランキング監視ダッシュボード v3
 import streamlit as st
 import pandas as pd
 import requests
-import json
 import os
 from datetime import datetime, timedelta
 import plotly.express as px
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-import threading
-import atexit
+from supabase import create_client, Client
+
+# --- Supabase設定 ---
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.environ.get("SUPABASE_URL", ""))
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", os.environ.get("SUPABASE_KEY", ""))
 
 # --- 設定 ---
-DATA_FILE = 'ranking_data.csv'
-CONFIG_FILE = 'config.json'
-PRODUCTS_FILE = 'products.json'
 SETTINGS_PASSWORD = "amznrnk"
 DOMAIN_ID = 5  # Amazon.co.jp
 
-# --- グローバルスケジューラー ---
-scheduler = None
-scheduler_lock = threading.Lock()
+# --- Supabaseクライアント ---
+@st.cache_resource
+def get_supabase_client() -> Client:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- ユーティリティ関数 ---
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {"api_key": "", "slack_url": ""}
-
-def save_config(config):
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(config, f, indent=4, ensure_ascii=False)
-
+# --- データベース操作関数 ---
 def load_products():
-    if os.path.exists(PRODUCTS_FILE):
-        with open(PRODUCTS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return []
+    """Supabaseから商品リストを取得"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return []
+    try:
+        response = supabase.table('products').select('*').order('created_at').execute()
+        return [{"asin": p['asin'], "title": p.get('title', '')} for p in response.data]
+    except Exception as e:
+        st.error(f"商品リスト取得エラー: {e}")
+        return []
 
-def save_products(products):
-    with open(PRODUCTS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(products, f, indent=4, ensure_ascii=False)
+def save_product(asin: str, title: str = ""):
+    """商品を追加"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False
+    try:
+        supabase.table('products').upsert({"asin": asin, "title": title}).execute()
+        return True
+    except Exception as e:
+        st.error(f"商品追加エラー: {e}")
+        return False
+
+def update_product_title(asin: str, title: str):
+    """商品タイトルを更新"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return
+    try:
+        supabase.table('products').update({"title": title}).eq('asin', asin).execute()
+    except:
+        pass
+
+def delete_product(asin: str):
+    """商品を削除"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return False
+    try:
+        supabase.table('products').delete().eq('asin', asin).execute()
+        return True
+    except Exception as e:
+        st.error(f"商品削除エラー: {e}")
+        return False
 
 def load_data():
-    if os.path.exists(DATA_FILE):
-        return pd.read_csv(DATA_FILE)
-    return pd.DataFrame(columns=["date", "asin", "title", "category_id", "category_name", "rank"])
+    """Supabaseからランキングデータを取得"""
+    supabase = get_supabase_client()
+    if not supabase:
+        return pd.DataFrame(columns=["date", "asin", "title", "category_id", "category_name", "rank"])
+    try:
+        response = supabase.table('ranking_data').select('*').order('date', desc=True).limit(5000).execute()
+        if response.data:
+            df = pd.DataFrame(response.data)
+            return df[["date", "asin", "title", "category_id", "category_name", "rank"]]
+        return pd.DataFrame(columns=["date", "asin", "title", "category_id", "category_name", "rank"])
+    except Exception as e:
+        st.error(f"ランキングデータ取得エラー: {e}")
+        return pd.DataFrame(columns=["date", "asin", "title", "category_id", "category_name", "rank"])
 
-def save_data(df):
-    df.to_csv(DATA_FILE, index=False)
+def save_ranking_data(results: list):
+    """ランキングデータを保存"""
+    supabase = get_supabase_client()
+    if not supabase or not results:
+        return
+    try:
+        # source列を除外
+        data = [{k: v for k, v in r.items() if k != 'source'} for r in results]
+        supabase.table('ranking_data').insert(data).execute()
+    except Exception as e:
+        st.error(f"ランキングデータ保存エラー: {e}")
+
+def load_config():
+    """設定を取得（Streamlit Secretsから）"""
+    return {
+        "api_key": st.secrets.get("KEEPA_API_KEY", os.environ.get("KEEPA_API_KEY", "")),
+        "slack_url": st.secrets.get("SLACK_WEBHOOK_URL", os.environ.get("SLACK_WEBHOOK_URL", ""))
+    }
 
 # --- Keepa API関数 ---
 def get_product_info(api_key, asin):
@@ -75,9 +128,9 @@ def get_product_info(api_key, asin):
         return {
             'asin': asin,
             'title': product.get('title', 'Unknown Product'),
-            'categories': product.get('categories', []),  # カテゴリIDの配列（末尾が最も詳細）
-            'categoryTree': product.get('categoryTree', []),  # カテゴリ名付きツリー
-            'salesRanks': product.get('stats', {}).get('salesRank', {})  # 従来のsalesRank
+            'categories': product.get('categories', []),
+            'categoryTree': product.get('categoryTree', []),
+            'salesRanks': product.get('stats', {}).get('salesRank', {})
         }
     except Exception as e:
         print(f"商品情報取得エラー ({asin}): {e}")
@@ -99,10 +152,7 @@ def get_category_name(api_key, category_id):
         return f'カテゴリ{category_id}'
 
 def get_bestseller_ranking(api_key, category_id, target_asin):
-    """
-    Best Sellers APIでカテゴリのランキングリストを取得し、
-    対象ASINの順位を返す
-    """
+    """Best Sellers APIでカテゴリのランキングリストを取得"""
     url = f"https://api.keepa.com/bestsellers?key={api_key}&domain={DOMAIN_ID}&category={category_id}"
     
     try:
@@ -110,27 +160,20 @@ def get_bestseller_ranking(api_key, category_id, target_asin):
         response.raise_for_status()
         data = response.json()
         
-        # bestSellersList にASINのリストが入っている
         if 'bestSellersList' in data and 'asinList' in data['bestSellersList']:
             asin_list = data['bestSellersList']['asinList']
-            
-            # 対象ASINの位置を探す
             try:
                 index = asin_list.index(target_asin)
-                return index + 1  # 0-indexed なので +1
+                return index + 1
             except ValueError:
-                return None  # リストに見つからない（圏外）
-        
+                return None
         return None
     except Exception as e:
         print(f"Best Sellers API エラー: {e}")
         return None
 
 def fetch_ranking_for_product(api_key, asin):
-    """
-    1つの商品について、所属するサブカテゴリでの順位を取得
-    """
-    # 1. 商品情報を取得
+    """1つの商品について、所属するサブカテゴリでの順位を取得"""
     product_info = get_product_info(api_key, asin)
     if not product_info:
         return None
@@ -143,13 +186,10 @@ def fetch_ranking_for_product(api_key, asin):
     results = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     
-    # 方法1: categoriesの末尾（最も詳細なサブカテゴリ）を使用
     if categories:
-        # 末尾から最大3つのカテゴリを試す
         for i, cat_id in enumerate(reversed(categories[:5])):
             cat_id = str(cat_id)
             
-            # カテゴリ名を取得
             cat_name = None
             for tree_item in category_tree:
                 if str(tree_item.get('catId')) == cat_id:
@@ -159,7 +199,6 @@ def fetch_ranking_for_product(api_key, asin):
             if not cat_name:
                 cat_name = get_category_name(api_key, cat_id)
             
-            # Best Sellers APIでランキング取得
             rank = get_bestseller_ranking(api_key, cat_id, asin)
             
             if rank:
@@ -173,12 +212,10 @@ def fetch_ranking_for_product(api_key, asin):
                     'source': 'bestsellers'
                 })
     
-    # 方法2: salesRankからも取得（フォールバック）
     if sales_ranks:
         for cat_id, rank in sales_ranks.items():
             cat_id = str(cat_id)
             
-            # 既に追加済みならスキップ
             if any(r['category_id'] == cat_id for r in results):
                 continue
             
@@ -217,7 +254,6 @@ def send_slack_notification(webhook_url, all_results, df_history):
     now = datetime.now()
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
     
-    # 商品ごとにグループ化
     by_product = {}
     for r in all_results:
         asin = r['asin']
@@ -236,11 +272,7 @@ def send_slack_notification(webhook_url, all_results, df_history):
         title = data['title'][:45] + "..." if len(data['title']) > 45 else data['title']
         amazon_url = f"https://www.amazon.co.jp/dp/{asin}"
         
-        lines = [
-            f"*{title}*",
-            f"<{amazon_url}|Amazon商品ページ>",
-            ""
-        ]
+        lines = [f"*{title}*", f"<{amazon_url}|Amazon商品ページ>", ""]
         
         for r in data['rankings']:
             rank = r['rank']
@@ -248,7 +280,6 @@ def send_slack_notification(webhook_url, all_results, df_history):
             cat_id = r['category_id']
             source = r.get('source', '')
             
-            # 前日比計算
             change_text = ""
             if not df_history.empty:
                 prev = df_history[
@@ -308,33 +339,14 @@ def fetch_all_rankings():
         
         if result:
             all_results.extend(result['results'])
-            product['title'] = result['title']
-    
-    save_products(products)
+            update_product_title(asin, result['title'])
     
     if all_results:
-        new_df = pd.DataFrame(all_results)
-        # source列があれば削除（保存時は不要）
-        if 'source' in new_df.columns:
-            new_df = new_df.drop(columns=['source'])
-        df = pd.concat([df, new_df], ignore_index=True)
-        save_data(df)
-        
+        save_ranking_data(all_results)
         send_slack_notification(config.get("slack_url"), all_results, df)
     
     print(f"[{datetime.now()}] ランキング取得完了: {len(all_results)}件")
     return all_results
-
-def init_scheduler():
-    global scheduler
-    with scheduler_lock:
-        if scheduler is None:
-            scheduler = BackgroundScheduler(timezone='Asia/Tokyo')
-            scheduler.add_job(fetch_all_rankings, CronTrigger(hour=10, minute=0), id='daily_ranking_job')
-            scheduler.start()
-            atexit.register(lambda: scheduler.shutdown())
-            print("スケジューラー起動: 毎日10:00に実行")
-    return scheduler
 
 # --- Streamlit UI ---
 def main():
@@ -362,7 +374,12 @@ def main():
     
     st.markdown('<p class="main-header">📊 Amazon Ranking Monitor</p>', unsafe_allow_html=True)
     
-    sched = init_scheduler()
+    # Supabase接続チェック
+    supabase = get_supabase_client()
+    if not supabase:
+        st.error("⚠️ Supabaseの設定が必要です。Streamlit SecretsにSUPABASE_URLとSUPABASE_KEYを設定してください。")
+        st.stop()
+    
     config = load_config()
     products = load_products()
     df = load_data()
@@ -371,11 +388,7 @@ def main():
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("📦 登録商品", len(products))
     col2.metric("📈 データ件数", len(df))
-    if sched and sched.running:
-        next_run = sched.get_job('daily_ranking_job').next_run_time
-        col3.metric("⏰ 次回実行", next_run.strftime('%m/%d %H:%M') if next_run else "-")
-    else:
-        col3.metric("⏰ 次回実行", "-")
+    col3.metric("💾 ストレージ", "Supabase")
     col4.metric("🕐 最終更新", df['date'].max()[:10] if not df.empty else "-")
     
     st.divider()
@@ -390,11 +403,11 @@ def main():
         with col_right:
             if st.button("🔄 今すぐ取得", type="primary", use_container_width=True):
                 if not config.get("api_key"):
-                    st.error("⚠️ APIキーを設定してください")
+                    st.error("⚠️ APIキーを設定してください（Streamlit Secrets）")
                 elif not products:
                     st.error("⚠️ 商品を登録してください")
                 else:
-                    with st.spinner("Keepaからデータを取得中...（Best Sellers API使用）"):
+                    with st.spinner("Keepaからデータを取得中..."):
                         results = fetch_all_rankings()
                         if results:
                             st.success(f"✅ {len(results)}件のランキングを取得しました")
@@ -445,10 +458,9 @@ def main():
                     if any(p['asin'] == asin for p in products):
                         st.error("既に登録済みです")
                     else:
-                        products.append({"asin": asin, "title": ""})
-                        save_products(products)
-                        st.success(f"✅ {asin} を追加しました")
-                        st.rerun()
+                        if save_product(asin):
+                            st.success(f"✅ {asin} を追加しました")
+                            st.rerun()
         
         st.divider()
         st.subheader("📋 登録済み商品")
@@ -459,9 +471,8 @@ def main():
                 col1.write(f"**{p.get('title') or '(未取得)'}**")
                 col2.code(p['asin'])
                 if col3.button("🗑️", key=f"del_{i}"):
-                    products.pop(i)
-                    save_products(products)
-                    st.rerun()
+                    if delete_product(p['asin']):
+                        st.rerun()
         else:
             st.info("商品が登録されていません")
     
@@ -498,42 +509,36 @@ def main():
     
     # --- 設定 ---
     with tab4:
-        if 'settings_unlocked' not in st.session_state:
-            st.session_state.settings_unlocked = False
+        st.subheader("⚙️ 設定情報")
         
-        if not st.session_state.settings_unlocked:
-            st.warning("🔒 設定を変更するにはパスワードが必要です")
-            col1, col2 = st.columns([3, 1])
-            password = col1.text_input("パスワード", type="password")
-            col2.write("")
-            col2.write("")
-            if col2.button("解除", use_container_width=True):
-                if password == SETTINGS_PASSWORD:
-                    st.session_state.settings_unlocked = True
-                    st.rerun()
-                else:
-                    st.error("パスワードが違います")
-        else:
-            st.success("🔓 設定編集可能")
-            if st.button("🔒 ロック"):
-                st.session_state.settings_unlocked = False
-                st.rerun()
-            
-            st.divider()
-            api_key = st.text_input("Keepa API Key", value=config.get("api_key", ""), type="password")
-            slack_url = st.text_input("Slack Webhook URL", value=config.get("slack_url", ""))
-            
-            if st.button("💾 保存", type="primary"):
-                save_config({"api_key": api_key, "slack_url": slack_url})
-                st.success("保存しました")
-                st.rerun()
-            
-            st.divider()
-            if st.button("🗑️ 全データ削除"):
-                if os.path.exists(DATA_FILE):
-                    os.remove(DATA_FILE)
-                st.success("削除しました")
-                st.rerun()
+        st.info("""
+        **設定はStreamlit Secretsで管理されています**
+        
+        Streamlit Cloudのダッシュボード → Settings → Secrets で以下を設定してください：
+        
+        ```toml
+        SUPABASE_URL = "https://xxxxx.supabase.co"
+        SUPABASE_KEY = "eyJxxxx..."
+        KEEPA_API_KEY = "あなたのKeepa APIキー"
+        SLACK_WEBHOOK_URL = "https://hooks.slack.com/..."
+        ```
+        """)
+        
+        st.divider()
+        st.subheader("📊 接続状態")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if SUPABASE_URL and SUPABASE_KEY:
+                st.success("✅ Supabase: 接続済み")
+            else:
+                st.error("❌ Supabase: 未設定")
+        
+        with col2:
+            if config.get("api_key"):
+                st.success("✅ Keepa API: 設定済み")
+            else:
+                st.error("❌ Keepa API: 未設定")
 
 
 if __name__ == "__main__":
