@@ -315,15 +315,27 @@ def send_slack_notification(webhook_url, all_results, df_history):
         print(f"Slack通知エラー: {e}")
 
 # --- メイン処理 ---
-def fetch_all_rankings():
+def fetch_all_rankings(debug_container=None):
     """全商品のランキングを取得"""
-    print(f"[{datetime.now()}] ランキング取得開始")
+    def debug(msg):
+        print(msg)
+        if debug_container:
+            debug_container.write(msg)
+    
+    debug(f"[{datetime.now()}] ランキング取得開始")
     
     config = load_config()
     products = load_products()
     
-    if not config.get("api_key") or not products:
-        print("APIキーまたは商品リストが未設定")
+    debug(f"API Key設定: {'あり' if config.get('api_key') else 'なし'}")
+    debug(f"商品数: {len(products)}")
+    
+    if not config.get("api_key"):
+        debug("❌ APIキーが未設定です")
+        return []
+    
+    if not products:
+        debug("❌ 商品リストが空です")
         return []
     
     df = load_data()
@@ -334,18 +346,21 @@ def fetch_all_rankings():
         if not asin:
             continue
         
-        print(f"取得中: {asin}")
+        debug(f"📦 取得中: {asin}")
         result = fetch_ranking_for_product(config["api_key"], asin)
         
         if result:
+            debug(f"  ✅ {result['title'][:30]}... ({len(result['results'])}カテゴリ)")
             all_results.extend(result['results'])
             update_product_title(asin, result['title'])
+        else:
+            debug(f"  ❌ 取得失敗: {asin}")
     
     if all_results:
         save_ranking_data(all_results)
         send_slack_notification(config.get("slack_url"), all_results, df)
     
-    print(f"[{datetime.now()}] ランキング取得完了: {len(all_results)}件")
+    debug(f"✅ 取得完了: {len(all_results)}件")
     return all_results
 
 # --- Streamlit UI ---
@@ -407,8 +422,9 @@ def main():
                 elif not products:
                     st.error("⚠️ 商品を登録してください")
                 else:
+                    debug_container = st.container()
                     with st.spinner("Keepaからデータを取得中..."):
-                        results = fetch_all_rankings()
+                        results = fetch_all_rankings(debug_container)
                         if results:
                             st.success(f"✅ {len(results)}件のランキングを取得しました")
                             st.rerun()
