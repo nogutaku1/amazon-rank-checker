@@ -112,16 +112,42 @@ def load_config():
     }
 
 # --- Keepa API関数 ---
+# グローバルなエラーログ
+_api_errors = []
+
+def get_api_errors():
+    return _api_errors
+
+def clear_api_errors():
+    global _api_errors
+    _api_errors = []
+
 def get_product_info(api_key, asin):
     """商品情報とカテゴリを取得"""
+    global _api_errors
     url = f"https://api.keepa.com/product?key={api_key}&domain={DOMAIN_ID}&asin={asin}"
     
     try:
-        response = requests.get(url)
-        response.raise_for_status()
+        response = requests.get(url, timeout=30)
+        
+        # レスポンスのステータスチェック
+        if response.status_code != 200:
+            error_msg = f"API Error {response.status_code}: {response.text[:200]}"
+            _api_errors.append(f"{asin}: {error_msg}")
+            print(error_msg)
+            return None
+        
         data = response.json()
         
+        # エラーチェック
+        if 'error' in data:
+            error_msg = f"Keepa Error: {data['error']}"
+            _api_errors.append(f"{asin}: {error_msg}")
+            print(error_msg)
+            return None
+        
         if 'products' not in data or len(data['products']) == 0:
+            _api_errors.append(f"{asin}: 商品が見つかりません")
             return None
         
         product = data['products'][0]
@@ -132,7 +158,11 @@ def get_product_info(api_key, asin):
             'categoryTree': product.get('categoryTree', []),
             'salesRanks': product.get('stats', {}).get('salesRank', {})
         }
+    except requests.exceptions.Timeout:
+        _api_errors.append(f"{asin}: タイムアウト")
+        return None
     except Exception as e:
+        _api_errors.append(f"{asin}: {str(e)}")
         print(f"商品情報取得エラー ({asin}): {e}")
         return None
 
@@ -330,6 +360,9 @@ def fetch_all_rankings(debug_container=None):
     debug(f"API Key設定: {'あり' if config.get('api_key') else 'なし'}")
     debug(f"商品数: {len(products)}")
     
+    # エラーログをクリア
+    clear_api_errors()
+    
     if not config.get("api_key"):
         debug("❌ APIキーが未設定です")
         return []
@@ -355,6 +388,13 @@ def fetch_all_rankings(debug_container=None):
             update_product_title(asin, result['title'])
         else:
             debug(f"  ❌ 取得失敗: {asin}")
+    
+    # APIエラーを表示
+    api_errors = get_api_errors()
+    if api_errors:
+        debug("--- APIエラー詳細 ---")
+        for err in api_errors[:5]:  # 最初の5件だけ表示
+            debug(f"⚠️ {err}")
     
     if all_results:
         save_ranking_data(all_results)
